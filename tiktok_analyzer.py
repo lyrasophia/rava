@@ -1,0 +1,701 @@
+import os
+import time
+import json
+import datetime
+import argparse
+import threading
+import csv
+from PIL import Image
+import pyautogui
+import openai
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+import pandas as pd
+import re
+from collections import Counter
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Note: You should rotate any API key immediately after testing
+OPENAI_API_KEY = "sk---="  # Replace with your new API key after rotation
+
+class LivestreamAnalyzer:
+    def __init__(self, duration=180, interval=10, output_dir="output", stream_name="product_launch"):
+        """
+        Initialize the livestream analyzer.
+        
+        Args:
+            duration (int): Total duration to analyze in seconds (default: 3 minutes)
+            interval (int): Screenshot interval in seconds (default: 10 seconds)
+            output_dir (str): Directory to save outputs
+            stream_name (str): Name of the stream for file naming
+        """
+        self.duration = duration
+        self.interval = interval
+        self.output_dir = output_dir
+        self.stream_name = stream_name
+        self.screenshot_dir = os.path.join(output_dir, "screenshots")
+        self.results_dir = os.path.join(output_dir, "results")
+        self.raw_data = []
+        self.screenshot_paths = []
+        
+        # Create necessary directories
+        os.makedirs(self.screenshot_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
+        
+        # Initialize OpenAI client
+        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    
+    def take_screenshots(self):
+        """Take screenshots at regular intervals for the specified duration."""
+        print(f"Starting screenshot capture for {self.duration} seconds...")
+        start_time = time.time()
+        end_time = start_time + self.duration
+        
+        try:
+            while time.time() < end_time:
+                # Take screenshot
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{self.stream_name}_{timestamp}.png"
+                filepath = os.path.join(self.screenshot_dir, filename)
+                
+                screenshot = pyautogui.screenshot()
+                screenshot.save(filepath)
+                self.screenshot_paths.append(filepath)
+                print(f"Screenshot saved: {filepath} ({len(self.screenshot_paths)} total)")
+                
+                # Calculate progress
+                time_elapsed = time.time() - start_time
+                time_remaining = end_time - time.time()
+                print(f"Capture progress: {time_elapsed:.1f}s / {self.duration}s ({time_remaining:.1f}s remaining)")
+                
+                # Only wait if we haven't reached the end time
+                if time.time() + self.interval < end_time:
+                    time.sleep(self.interval)
+        
+        except KeyboardInterrupt:
+            print("Screenshot capture interrupted by user.")
+        
+        print(f"Screenshot capture complete. Captured {len(self.screenshot_paths)} screenshots.")
+    
+    def encode_image_to_base64(self, image_path):
+        """Encode image to base64 string"""
+        try:
+            with open(image_path, "rb") as image_file:
+                import base64
+                return base64.b64encode(image_file.read()).decode('utf-8')
+        except Exception as e:
+            print(f"Error encoding image {image_path}: {e}")
+            return None
+    
+    def analyze_screenshot(self, screenshot_path, max_retries=3):
+        """
+        Analyze a single screenshot using GPT-4o's vision capabilities.
+        
+        Args:
+            screenshot_path (str): Path to the screenshot
+            max_retries (int): Maximum number of retries for failed API calls
+            
+        Returns:
+            Dict: Analysis results for the screenshot
+        """
+        base64_image = self.encode_image_to_base64(screenshot_path)
+        if not base64_image:
+            print(f"Could not encode image {screenshot_path}. Skipping analysis.")
+            return self._create_fallback_result(screenshot_path)
+        
+        # Create the messages with an improved prompt that focuses on correctly identifying viewers vs likes
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """Analyze this TikTok livestream screenshot and extract the following information accurately:
+
+1. Viewer count - Look for a number next to a person/people icon (NOT the heart icon)
+2. Likes count - Look for a number next to a heart icon (NOT the people icon)
+3. Overall comment sentiment (positive, negative, or neutral)
+4. Sentiment score (-1.0 to 1.0)
+5. Detailed comment analysis:
+   - Extract raw comments (each comment separately in a list)
+   - Look for comments about shade matching
+   - Look for comments about product confusion
+   - Look for comments about promotions & offers
+   - Specific product names mentioned
+   - Specific problems viewers are asking about
+   - Rank the top 3 questions/concerns by frequency
+6. Engagement level (low, medium, high)
+7. User demographics (if visible):
+   - Age group (range)
+   - Gender
+   - Interests
+   - Locations
+8. Sales indicators (any evidence of purchase intent or conversions)
+9. Key recommendations for the streamer
+
+IMPORTANT: Pay careful attention to distinguish between viewer count (people icon) and likes count (heart icon).
+
+Respond using JSON format with these exact keys:
+{
+  "viewer_count": int,
+  "likes_count": int,
+  "sentiment_label": "string",
+  "sentiment_score": float,
+  "raw_comments": ["list of individual comments"],
+  "shade_matching_comments": ["list of shade matching comments"],
+  "product_confusion_comments": ["list of confusion comments"],
+  "promotions_offers_comments": ["list of promotions comments"],
+  "product_mentions": ["list of products mentioned"],
+  "specific_concerns": ["list of concerns"],
+  "top_3_questions": ["list of specific questions"],
+  "engagement_level": "string",
+  "age_group": "string",
+  "gender": "string",
+  "interests": ["list of interests"],
+  "locations": ["list of locations"],
+  "sales_indicators": ["list"],
+  "recommendations": ["list"],
+  "strengths": ["list"],
+  "weaknesses": ["list"]
+}"""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        for attempt in range(max_retries):
+            try:
+                # Request analysis from OpenAI
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    max_tokens=1500,
+                    response_format={"type": "json_object"}  # Force JSON response format
+                )
+                
+                result_text = response.choices[0].message.content
+                
+                try:
+                    # Parse JSON response
+                    result = json.loads(result_text)
+                    
+                    # Add timestamp and image path
+                    result["timestamp"] = datetime.datetime.now().isoformat()
+                    result["image_path"] = screenshot_path
+                    
+                    print(f"Successfully analyzed: {os.path.basename(screenshot_path)}")
+                    return result
+                    
+                except json.JSONDecodeError as e:
+                    print(f"Attempt {attempt+1}/{max_retries} - JSON parse error: {e}")
+                    # If last attempt, create fallback result
+                    if attempt == max_retries - 1:
+                        print(f"Failed to parse JSON after {max_retries} attempts, using fallback")
+                        break
+            
+            except Exception as e:
+                print(f"Attempt {attempt+1}/{max_retries} - API error: {e}")
+                # If last attempt, create fallback result
+                if attempt == max_retries - 1:
+                    print(f"API call failed after {max_retries} attempts, using fallback")
+                    break
+                time.sleep(2)  # Wait before retry
+        
+        # Create fallback result if all attempts failed
+        return self._create_fallback_result(screenshot_path)
+    
+    def _create_fallback_result(self, screenshot_path):
+        """Create a fallback result when analysis fails"""
+        return {
+            "viewer_count": 0,
+            "likes_count": 0,
+            "sentiment_score": 0,
+            "sentiment_label": "neutral",
+            "raw_comments": [],
+            "shade_matching_comments": [],
+            "product_confusion_comments": [],
+            "promotions_offers_comments": [],
+            "product_mentions": ["Unknown"],
+            "specific_concerns": ["Unknown"],
+            "top_3_questions": ["Unknown"],
+            "engagement_level": "unknown",
+            "age_group": "unknown",
+            "gender": "unknown",
+            "interests": ["unknown"],
+            "locations": ["unknown"],
+            "sales_indicators": [],
+            "recommendations": ["Check screenshot manually"],
+            "strengths": ["Unknown"],
+            "weaknesses": ["Unknown"],
+            "timestamp": datetime.datetime.now().isoformat(),
+            "image_path": screenshot_path
+        }
+    
+    def generate_executive_summary_csv(self):
+        """
+        Generate Executive Summary CSV file based on the analysis results.
+        """
+        if not self.raw_data:
+            print("No data to save to Executive Summary CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_executive_summary.csv")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Metric', 'Value']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Calculate executive summary metrics
+            if self.raw_data:
+                # Duration
+                writer.writerow({
+                    'Metric': 'Analysis Duration (seconds)', 
+                    'Value': self.duration
+                })
+                
+                # Screenshots analyzed
+                writer.writerow({
+                    'Metric': 'Screenshots Analyzed', 
+                    'Value': len(self.raw_data)
+                })
+                
+                # Average sentiment score - handle potential None values
+                sentiment_scores = [item.get('sentiment_score', 0) for item in self.raw_data]
+                sentiment_scores = [score for score in sentiment_scores if score is not None]  # Filter out None values
+                avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0
+                writer.writerow({
+                    'Metric': 'Average Sentiment Score', 
+                    'Value': f"{avg_sentiment:.2f} ({self._get_sentiment_label(avg_sentiment)})"
+                })
+                
+                # Total comments - handle potential None values
+                total_comments = 0
+                for item in self.raw_data:
+                    comments = item.get('raw_comments', [])
+                    if comments is not None:
+                        total_comments += len(comments)
+                
+                writer.writerow({
+                    'Metric': 'Total Comments', 
+                    'Value': total_comments
+                })
+                
+                # Min and max viewers - handle potential None values
+                viewer_counts = [item.get('viewer_count', 0) for item in self.raw_data]
+                viewer_counts = [count for count in viewer_counts if count is not None]  # Filter out None values
+                min_viewers = min(viewer_counts) if viewer_counts else 0
+                max_viewers = max(viewer_counts) if viewer_counts else 0
+                writer.writerow({
+                    'Metric': 'Min Viewers', 
+                    'Value': min_viewers
+                })
+                writer.writerow({
+                    'Metric': 'Max Viewers', 
+                    'Value': max_viewers
+                })
+                
+                # Max likes - handle potential None values
+                likes_counts = [item.get('likes_count', 0) for item in self.raw_data]
+                likes_counts = [count for count in likes_counts if count is not None]  # Filter out None values
+                max_likes = max(likes_counts) if likes_counts else 0
+                writer.writerow({
+                    'Metric': 'Max Likes', 
+                    'Value': max_likes
+                })
+                
+                # Likes growth - handle potential None values
+                first_likes = self.raw_data[0].get('likes_count', 0)
+                last_likes = self.raw_data[-1].get('likes_count', 0)
+                first_likes = 0 if first_likes is None else first_likes
+                last_likes = 0 if last_likes is None else last_likes
+                
+                likes_growth = ((last_likes - first_likes) / first_likes * 100) if first_likes > 0 else 0
+                writer.writerow({
+                    'Metric': 'Likes Growth', 
+                    'Value': f"{likes_growth:.2f}%"
+                })
+                
+                # Viewer growth - handle potential None values
+                first_viewers = self.raw_data[0].get('viewer_count', 0)
+                last_viewers = self.raw_data[-1].get('viewer_count', 0)
+                first_viewers = 0 if first_viewers is None else first_viewers
+                last_viewers = 0 if last_viewers is None else last_viewers
+                
+                viewer_growth = ((last_viewers - first_viewers) / first_viewers * 100) if first_viewers > 0 else 0
+                writer.writerow({
+                    'Metric': 'Viewer Growth', 
+                    'Value': f"{viewer_growth:.2f}%"
+                })
+                
+        print(f"Executive Summary CSV saved: {csv_path}")
+        return csv_path
+    
+    def _get_sentiment_label(self, score):
+        """Convert numerical sentiment score to label"""
+        if score < -0.3:
+            return "negative"
+        elif score > 0.3:
+            return "positive"
+        else:
+            return "neutral"
+    
+    def generate_performance_csv(self):
+        """
+        Generate Livestream Performance CSV with time-series data.
+        """
+        if not self.raw_data:
+            print("No data to save to Performance CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_performance.csv")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Timestamp', 'Viewers', 'Likes', 'Sentiment', 'Engagement']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for item in self.raw_data:
+                writer.writerow({
+                    'Timestamp': item.get('timestamp', ''),
+                    'Viewers': item.get('viewer_count', 0),
+                    'Likes': item.get('likes_count', 0),
+                    'Sentiment': item.get('sentiment_score', 0),
+                    'Engagement': item.get('engagement_level', 'unknown')
+                })
+                
+        print(f"Performance CSV saved: {csv_path}")
+        return csv_path
+    
+    def generate_questions_csv(self):
+        """
+        Generate Top Questions and Comment Themes CSV.
+        """
+        if not self.raw_data:
+            print("No data to save to Questions CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_questions.csv")
+        
+        # Prepare data points to track over time
+        timestamps = []
+        shade_matching_counts = []
+        product_confusion_counts = []
+        promotions_counts = []
+        
+        for item in self.raw_data:
+            timestamp_str = item.get('timestamp', '')
+            try:
+                dt = datetime.datetime.fromisoformat(timestamp_str)
+                simple_timestamp = dt.strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                simple_timestamp = timestamp_str
+                
+            timestamps.append(simple_timestamp)
+            shade_matching_counts.append(len(item.get('shade_matching_comments', [])))
+            product_confusion_counts.append(len(item.get('product_confusion_comments', [])))
+            promotions_counts.append(len(item.get('promotions_offers_comments', [])))
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Timestamp', 'Shade Matching Comments', 'Product Confusion Comments', 'Promotions & Offers Comments']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for i in range(len(timestamps)):
+                writer.writerow({
+                    'Timestamp': timestamps[i],
+                    'Shade Matching Comments': shade_matching_counts[i],
+                    'Product Confusion Comments': product_confusion_counts[i],
+                    'Promotions & Offers Comments': promotions_counts[i]
+                })
+                
+        print(f"Questions CSV saved: {csv_path}")
+        return csv_path
+    
+    def generate_comments_csv(self):
+        """
+        Generate Comments Sentiment Analysis CSV.
+        """
+        if not self.raw_data:
+            print("No data to save to Comments CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_comments.csv")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Time', 'Viewers', 'Likes', 'Question', 'Sentiment', 'Category']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for item in self.raw_data:
+                timestamp_str = item.get('timestamp', '')
+                try:
+                    dt = datetime.datetime.fromisoformat(timestamp_str)
+                    simple_timestamp = dt.strftime("%H:%M:%S")
+                except (ValueError, TypeError):
+                    simple_timestamp = timestamp_str
+                
+                viewers = item.get('viewer_count', 0)
+                likes = item.get('likes_count', 0)
+                sentiment = item.get('sentiment_score', 0)
+                
+                # Process all comments from this screenshot
+                raw_comments = item.get('raw_comments', [])
+                
+                # Categorize each comment
+                for comment in raw_comments:
+                    category = "General"
+                    
+                    # Check if comment is in any special category
+                    if comment in item.get('shade_matching_comments', []):
+                        category = "Shade Matching"
+                    elif comment in item.get('product_confusion_comments', []):
+                        category = "Product Confusion"
+                    elif comment in item.get('promotions_offers_comments', []):
+                        category = "Promotions & Offers"
+                    elif comment in item.get('top_3_questions', []):
+                        category = "Top Question"
+                    
+                    writer.writerow({
+                        'Time': simple_timestamp,
+                        'Viewers': viewers,
+                        'Likes': likes,
+                        'Question': comment,
+                        'Sentiment': sentiment,
+                        'Category': category
+                    })
+                
+        print(f"Comments CSV saved: {csv_path}")
+        return csv_path
+    
+    def generate_insights_csv(self):
+        """
+        Generate Strategic Insights CSV.
+        """
+        if not self.raw_data:
+            print("No data to save to Insights CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_insights.csv")
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Category', 'Item', 'Frequency']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Count recommendations across all data points
+            rec_counts = Counter()
+            for item in self.raw_data:
+                recs = item.get('recommendations', [])
+                if isinstance(recs, list):
+                    for rec in recs:
+                        if isinstance(rec, str) and rec.strip() and rec.lower() not in ['unknown', 'check screenshot manually']:
+                            rec_counts[rec.strip()] += 1
+            
+            # Write recommendations
+            for rec, count in rec_counts.most_common():
+                writer.writerow({
+                    'Category': 'Recommendation',
+                    'Item': rec,
+                    'Frequency': count
+                })
+            
+            # Count strengths across all data points
+            strengths_counts = Counter()
+            for item in self.raw_data:
+                strengths = item.get('strengths', [])
+                if isinstance(strengths, list):
+                    for strength in strengths:
+                        if isinstance(strength, str) and strength.strip() and strength.lower() not in ['unknown']:
+                            strengths_counts[strength.strip()] += 1
+            
+            # Write strengths
+            for strength, count in strengths_counts.most_common():
+                writer.writerow({
+                    'Category': 'Strength',
+                    'Item': strength,
+                    'Frequency': count
+                })
+            
+            # Count weaknesses across all data points
+            weaknesses_counts = Counter()
+            for item in self.raw_data:
+                weaknesses = item.get('weaknesses', [])
+                if isinstance(weaknesses, list):
+                    for weakness in weaknesses:
+                        if isinstance(weakness, str) and weakness.strip() and weakness.lower() not in ['unknown']:
+                            weaknesses_counts[weakness.strip()] += 1
+            
+            # Write weaknesses
+            for weakness, count in weaknesses_counts.most_common():
+                writer.writerow({
+                    'Category': 'Weakness',
+                    'Item': weakness,
+                    'Frequency': count
+                })
+                
+        print(f"Insights CSV saved: {csv_path}")
+        return csv_path
+    
+    def generate_audience_csv(self):
+        """
+        Generate Audience Insights CSV.
+        """
+        if not self.raw_data:
+            print("No data to save to Audience CSV.")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(self.results_dir, f"{self.stream_name}_{timestamp}_audience.csv")
+        
+        # Collect demographic data from all items
+        age_groups = []
+        genders = []
+        all_interests = []
+        all_locations = []
+        
+        for item in self.raw_data:
+            age_group = item.get('age_group', 'unknown')
+            gender = item.get('gender', 'unknown')
+            interests = item.get('interests', [])
+            locations = item.get('locations', [])
+            
+            if age_group and age_group.lower() != 'unknown':
+                age_groups.append(age_group)
+            
+            if gender and gender.lower() != 'unknown':
+                genders.append(gender)
+            
+            if isinstance(interests, list):
+                all_interests.extend([i for i in interests if isinstance(i, str) and i.lower() != 'unknown'])
+            
+            if isinstance(locations, list):
+                all_locations.extend([l for l in locations if isinstance(l, str) and l.lower() != 'unknown'])
+        
+        # Count frequencies
+        age_counts = Counter(age_groups)
+        gender_counts = Counter(genders)
+        interest_counts = Counter(all_interests)
+        location_counts = Counter(all_locations)
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Category', 'Value', 'Count']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Write age groups
+            for age, count in age_counts.most_common():
+                writer.writerow({
+                    'Category': 'Age Group',
+                    'Value': age,
+                    'Count': count
+                })
+            
+            # Write genders
+            for gender, count in gender_counts.most_common():
+                writer.writerow({
+                    'Category': 'Gender',
+                    'Value': gender,
+                    'Count': count
+                })
+            
+            # Write interests
+            for interest, count in interest_counts.most_common():
+                writer.writerow({
+                    'Category': 'Interest',
+                    'Value': interest,
+                    'Count': count
+                })
+            
+            # Write locations
+            for location, count in location_counts.most_common():
+                writer.writerow({
+                    'Category': 'Location',
+                    'Value': location,
+                    'Count': count
+                })
+                
+        print(f"Audience CSV saved: {csv_path}")
+        return csv_path
+    
+    def generate_all_csv_files(self):
+        """Generate all CSV files with structured format"""
+        csv_files = {
+            'executive_summary': self.generate_executive_summary_csv(),
+            'performance': self.generate_performance_csv(),
+            'questions': self.generate_questions_csv(),
+            'comments': self.generate_comments_csv(),
+            'insights': self.generate_insights_csv(),
+            'audience': self.generate_audience_csv()
+        }
+        return csv_files
+    
+    def run_analysis(self):
+        """Run the complete livestream analysis process."""
+        print(f"Starting livestream analysis for {self.duration} seconds...")
+        
+        # Step 1: Capture screenshots
+        self.take_screenshots()
+        
+        if not self.screenshot_paths:
+            print("No screenshots captured. Analysis aborted.")
+            return
+            
+        # Step 2: Process screenshots one by one
+        print(f"Processing {len(self.screenshot_paths)} screenshots...")
+        
+        for i, screenshot_path in enumerate(self.screenshot_paths):
+            print(f"Processing screenshot {i+1}/{len(self.screenshot_paths)}: {os.path.basename(screenshot_path)}")
+            
+            # Analyze screenshot
+            result = self.analyze_screenshot(screenshot_path)
+            self.raw_data.append(result)
+            
+            # Save individual result
+            result_filename = f"{os.path.basename(screenshot_path).split('.')[0]}_result.json"
+            with open(os.path.join(self.results_dir, result_filename), 'w') as f:
+                json.dump(result, f, indent=2)
+        
+        # Step 3: Generate CSV files with restructured format
+        if self.raw_data:
+            print("Generating CSV files...")
+            csv_files = self.generate_all_csv_files()
+            print(f"CSV files generated. Files saved to: {self.results_dir}")
+            return csv_files
+        else:
+            print("No data collected. CSV generation skipped.")
+            return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TikTok Livestream Analysis Tool")
+    parser.add_argument("--duration", type=int, default=180, help="Analysis duration in seconds (default: 180)")
+    parser.add_argument("--interval", type=int, default=10, help="Screenshot interval in seconds (default: 10)")
+    parser.add_argument("--output", default="output", help="Output directory (default: output)")
+    parser.add_argument("--stream-name", default="product_launch", help="Stream name for file naming")
+    
+    args = parser.parse_args()
+    
+    analyzer = LivestreamAnalyzer(
+        duration=args.duration,
+        interval=args.interval,
+        output_dir=args.output,
+        stream_name=args.stream_name
+    )
+    
+    analyzer.run_analysis()
+
+if __name__ == "__main__":
+    main()

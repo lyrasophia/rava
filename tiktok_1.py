@@ -1,0 +1,920 @@
+import os
+import time
+import json
+import datetime
+import argparse
+import threading
+from PIL import Image
+import pyautogui
+import openai
+from fpdf import FPDF
+import matplotlib.pyplot as plt
+import numpy as np
+from io import BytesIO
+import base64
+from typing import List, Dict, Any
+
+# Note: You should rotate any API key immediately after testing
+OPENAI_API_KEY = "sk-proj--"  # Replace with your new API key after rotation
+
+class LivestreamAnalyzer:
+    def __init__(self, duration=180, interval=10, output_dir="output", stream_name="product_launch"):
+        """
+        Initialize the livestream analyzer.
+        
+        Args:
+            duration (int): Total duration to analyze in seconds (default: 3 minutes)
+            interval (int): Screenshot interval in seconds (default: 10 seconds)
+            output_dir (str): Directory to save outputs
+            stream_name (str): Name of the stream for file naming
+        """
+        self.duration = duration
+        self.interval = interval
+        self.output_dir = output_dir
+        self.stream_name = stream_name
+        self.screenshot_dir = os.path.join(output_dir, "screenshots")
+        self.results_dir = os.path.join(output_dir, "results")
+        self.sentiment_data = []
+        self.viewer_data = []
+        self.likes_data = []
+        self.comment_trends = {}
+        self.screenshot_paths = []
+        
+        # Create necessary directories
+        os.makedirs(self.screenshot_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
+        
+        # Initialize OpenAI client
+        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    
+    def take_screenshots(self):
+        """Take screenshots at regular intervals for the specified duration."""
+        print(f"Starting screenshot capture for {self.duration} seconds...")
+        start_time = time.time()
+        end_time = start_time + self.duration
+        
+        try:
+            while time.time() < end_time:
+                # Take screenshot
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{self.stream_name}_{timestamp}.png"
+                filepath = os.path.join(self.screenshot_dir, filename)
+                
+                screenshot = pyautogui.screenshot()
+                screenshot.save(filepath)
+                self.screenshot_paths.append(filepath)
+                print(f"Screenshot saved: {filepath} ({len(self.screenshot_paths)} total)")
+                
+                # Calculate progress
+                time_elapsed = time.time() - start_time
+                time_remaining = end_time - time.time()
+                print(f"Capture progress: {time_elapsed:.1f}s / {self.duration}s ({time_remaining:.1f}s remaining)")
+                
+                # Only wait if we haven't reached the end time
+                if time.time() + self.interval < end_time:
+                    time.sleep(self.interval)
+        
+        except KeyboardInterrupt:
+            print("Screenshot capture interrupted by user.")
+        
+        print(f"Screenshot capture complete. Captured {len(self.screenshot_paths)} screenshots.")
+    
+    def encode_image_to_base64(self, image_path):
+        """Encode image to base64 string"""
+        try:
+            with open(image_path, "rb") as image_file:
+                return base64.b64encode(image_file.read()).decode('utf-8')
+        except Exception as e:
+            print(f"Error encoding image {image_path}: {e}")
+            return None
+    
+    def analyze_screenshot(self, screenshot_path, max_retries=3):
+        """
+        Analyze a single screenshot using GPT-4o's vision capabilities.
+        
+        Args:
+            screenshot_path (str): Path to the screenshot
+            max_retries (int): Maximum number of retries for failed API calls
+            
+        Returns:
+            Dict: Analysis results for the screenshot
+        """
+        base64_image = self.encode_image_to_base64(screenshot_path)
+        if not base64_image:
+            print(f"Could not encode image {screenshot_path}. Skipping analysis.")
+            return self._create_fallback_result(screenshot_path)
+        
+        # Create the messages with an improved prompt that focuses on correctly identifying viewers vs likes
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """Analyze this TikTok livestream screenshot and extract the following information accurately:
+
+1. Viewer count - Look for a number next to a person/people icon (NOT the heart icon)
+2. Likes count - Look for a number next to a heart icon (NOT the people icon)
+3. Overall comment sentiment (positive, negative, or neutral)
+4. Sentiment score (-1.0 to 1.0)
+5. Detailed comment analysis - Be SPECIFIC about:
+   - The most common product questions (shades, undertones, application technique, etc.)
+   - Specific product names mentioned
+   - Specific problems viewers are asking about
+   - Rank the top 3 questions/concerns by frequency
+6. Engagement level (low, medium, high)
+7. Sales indicators (any evidence of purchase intent or conversions)
+8. Key recommendations for the streamer
+
+IMPORTANT: Pay careful attention to distinguish between viewer count (people icon) and likes count (heart icon).
+
+Respond using JSON format with these exact keys:
+{
+  "viewer_count": int,
+  "likes_count": int,
+  "sentiment_label": "string",
+  "sentiment_score": float,
+  "comment_analysis": "string",
+  "top_3_questions": ["list of specific questions"],
+  "product_mentions": ["list of products mentioned"],
+  "specific_concerns": ["list of concerns"],
+  "engagement_level": "string",
+  "sales_indicators": ["list"],
+  "recommendations": ["list"]
+}"""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        for attempt in range(max_retries):
+            try:
+                # Request analysis from OpenAI
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    max_tokens=1200,
+                    response_format={"type": "json_object"}  # Force JSON response format
+                )
+                
+                result_text = response.choices[0].message.content
+                
+                try:
+                    # Parse JSON response
+                    result = json.loads(result_text)
+                    
+                    # Add timestamp and image path
+                    result["timestamp"] = datetime.datetime.now().isoformat()
+                    result["image_path"] = screenshot_path
+                    
+                    # Extract viewer and likes count for tracking
+                    if "viewer_count" in result and isinstance(result["viewer_count"], int):
+                        self.viewer_data.append({
+                            "timestamp": result["timestamp"],
+                            "viewers": result["viewer_count"]
+                        })
+                        
+                    if "likes_count" in result and isinstance(result["likes_count"], int):
+                        self.likes_data.append({
+                            "timestamp": result["timestamp"],
+                            "likes": result["likes_count"]
+                        })
+                        
+                    # Track comment trends
+                    if "top_3_questions" in result and isinstance(result["top_3_questions"], list):
+                        for question in result["top_3_questions"]:
+                            if isinstance(question, str):
+                                question = question.strip()
+                                if question:
+                                    self.comment_trends[question] = self.comment_trends.get(question, 0) + 1
+                    
+                    print(f"Successfully analyzed: {os.path.basename(screenshot_path)}")
+                    return result
+                    
+                except json.JSONDecodeError as e:
+                    print(f"Attempt {attempt+1}/{max_retries} - JSON parse error: {e}")
+                    # If last attempt, create fallback result
+                    if attempt == max_retries - 1:
+                        print(f"Failed to parse JSON after {max_retries} attempts, using fallback")
+                        break
+            
+            except Exception as e:
+                print(f"Attempt {attempt+1}/{max_retries} - API error: {e}")
+                # If last attempt, create fallback result
+                if attempt == max_retries - 1:
+                    print(f"API call failed after {max_retries} attempts, using fallback")
+                    break
+                time.sleep(2)  # Wait before retry
+        
+        # Create fallback result if all attempts failed
+        return self._create_fallback_result(screenshot_path)
+    
+    def _create_fallback_result(self, screenshot_path):
+        """Create a fallback result when analysis fails"""
+        return {
+            "viewer_count": 0,
+            "likes_count": 0,
+            "sentiment_score": 0,
+            "sentiment_label": "neutral",
+            "comment_analysis": "Analysis failed",
+            "top_3_questions": ["Unknown"],
+            "product_mentions": ["Unknown"],
+            "specific_concerns": ["Unknown"],
+            "engagement_level": "unknown",
+            "sales_indicators": [],
+            "recommendations": ["Check screenshot manually"],
+            "timestamp": datetime.datetime.now().isoformat(),
+            "image_path": screenshot_path
+        }
+    
+    def create_sentiment_chart(self, sentiment_data):
+        """Create a sentiment chart from the collected data and return the path and analysis."""
+        if not sentiment_data:
+            return None, "No sentiment data available for analysis."
+            
+        timestamps = []
+        sentiment_scores = []
+        
+        for data in sentiment_data:
+            if "timestamp" in data and "sentiment_score" in data:
+                try:
+                    timestamp = datetime.datetime.fromisoformat(data["timestamp"])
+                    score = float(data["sentiment_score"])
+                    timestamps.append(timestamp)
+                    sentiment_scores.append(score)
+                except (ValueError, TypeError) as e:
+                    print(f"Error parsing sentiment data: {e}")
+        
+        if not timestamps or not sentiment_scores:
+            return None, "No valid sentiment data points available."
+            
+        plt.figure(figsize=(10, 6))
+        plt.plot(timestamps, sentiment_scores, marker='o', linestyle='-', color='blue')
+        plt.axhline(y=0, color='r', linestyle='--', alpha=0.3)
+        plt.fill_between(timestamps, sentiment_scores, 0, where=[s > 0 for s in sentiment_scores], color='green', alpha=0.3)
+        plt.fill_between(timestamps, sentiment_scores, 0, where=[s < 0 for s in sentiment_scores], color='red', alpha=0.3)
+        plt.title('Sentiment Analysis Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Sentiment Score (-1 to 1)')
+        plt.ylim(-1.1, 1.1)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        # Save the chart to a file
+        chart_path = os.path.join(self.results_dir, f"{self.stream_name}_sentiment_chart.png")
+        try:
+            plt.savefig(chart_path)
+            plt.close()
+            
+            # Generate analysis of the sentiment chart
+            avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0
+            positive_periods = sum(1 for s in sentiment_scores if s > 0.3)
+            negative_periods = sum(1 for s in sentiment_scores if s < -0.3)
+            neutral_periods = len(sentiment_scores) - positive_periods - negative_periods
+            
+            analysis = f"Sentiment Analysis: The average sentiment score was {avg_sentiment:.2f} on a scale from -1 (negative) to 1 (positive). "
+            
+            # Add trend analysis
+            if len(sentiment_scores) > 2:
+                start_sentiment = sentiment_scores[0]
+                end_sentiment = sentiment_scores[-1]
+                change = end_sentiment - start_sentiment
+                
+                if abs(change) < 0.1:
+                    analysis += "The overall sentiment remained stable throughout the livestream. "
+                elif change > 0:
+                    analysis += f"The sentiment improved over time by {change:.2f} points, showing increasing viewer satisfaction. "
+                else:
+                    analysis += f"The sentiment declined over time by {abs(change):.2f} points, suggesting decreasing viewer satisfaction. "
+            
+            # Add distribution analysis
+            analysis += f"During the analysis period, there were {positive_periods} instances of positive sentiment, "
+            analysis += f"{negative_periods} instances of negative sentiment, and {neutral_periods} instances of neutral sentiment. "
+            
+            # Add recommendations based on sentiment
+            if avg_sentiment > 0.5:
+                analysis += "Recommendation: The stream had very positive sentiment. Maintain the current approach and engagement style."
+            elif avg_sentiment > 0:
+                analysis += "Recommendation: The stream had mostly positive sentiment. Consider addressing any negative comments to further improve viewer satisfaction."
+            elif avg_sentiment > -0.5:
+                analysis += "Recommendation: The stream had mixed to slightly negative sentiment. Identify and address the common concerns to improve future streams."
+            else:
+                analysis += "Recommendation: The stream had significant negative sentiment. Review the most frequent concerns and consider adjusting the content strategy."
+            
+            return chart_path, analysis
+            
+        except Exception as e:
+            print(f"Error creating sentiment chart: {e}")
+            return None, "Failed to create sentiment chart due to technical issues."
+    
+    def create_viewer_chart(self, viewer_data):
+        """Create a viewer count chart from the collected data and return the path, analysis, and drop-off data."""
+        if not viewer_data:
+            return None, "No viewer data available for analysis.", [], []
+            
+        # Sort data by timestamp
+        try:
+            sorted_data = sorted(viewer_data, key=lambda x: x["timestamp"])
+        except Exception as e:
+            print(f"Error sorting viewer data: {e}")
+            return None, "Error sorting viewer data.", [], []
+            
+        timestamps = []
+        viewer_counts = []
+        
+        for data in sorted_data:
+            if "timestamp" in data and "viewers" in data:
+                try:
+                    timestamp = datetime.datetime.fromisoformat(data["timestamp"])
+                    viewers = int(data["viewers"])
+                    timestamps.append(timestamp)
+                    viewer_counts.append(viewers)
+                except (ValueError, TypeError) as e:
+                    print(f"Error parsing viewer data: {e}")
+        
+        if not timestamps or not viewer_counts:
+            return None, "No valid viewer data points available.", [], []
+            
+        # Format timestamps for display
+        formatted_times = [ts.strftime("%H:%M:%S") for ts in timestamps]
+        
+        # Create viewer count chart
+        plt.figure(figsize=(10, 6))
+        plt.plot(timestamps, viewer_counts, marker='o', linestyle='-', color='orange', label='Viewers')
+        plt.title('Number of Viewers Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Number of Viewers')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save chart
+        viewer_chart_path = os.path.join(self.results_dir, f"{self.stream_name}_viewer_chart.png")
+        
+        try:
+            plt.savefig(viewer_chart_path)
+            plt.close()
+            
+            # Generate analysis of viewer chart
+            if len(viewer_counts) > 1:
+                max_viewers = max(viewer_counts)
+                min_viewers = min(viewer_counts)
+                avg_viewers = sum(viewer_counts) / len(viewer_counts)
+                start_viewers = viewer_counts[0]
+                end_viewers = viewer_counts[-1]
+                
+                analysis = f"Viewer Analysis: The stream averaged {avg_viewers:.0f} viewers, with a peak of {max_viewers} and a minimum of {min_viewers}. "
+                
+                # Trend analysis
+                if end_viewers > start_viewers:
+                    growth = ((end_viewers - start_viewers) / start_viewers * 100) if start_viewers > 0 else 0
+                    analysis += f"Viewership grew throughout the stream by {growth:.1f}%, indicating increasing audience interest. "
+                elif end_viewers < start_viewers:
+                    decline = ((start_viewers - end_viewers) / start_viewers * 100) if start_viewers > 0 else 0
+                    analysis += f"Viewership declined by {decline:.1f}% over the duration, suggesting some audience drop-off. "
+                else:
+                    analysis += "Viewership remained stable throughout the stream, indicating consistent audience engagement. "
+                
+                # Pattern analysis
+                changes = [viewer_counts[i+1] - viewer_counts[i] for i in range(len(viewer_counts)-1)]
+                positive_changes = sum(1 for c in changes if c > 0)
+                negative_changes = sum(1 for c in changes if c < 0)
+                
+                if positive_changes > negative_changes:
+                    analysis += "The overall trend showed more viewership increases than decreases. "
+                elif negative_changes > positive_changes:
+                    analysis += "The overall trend showed more viewership decreases than increases. "
+                else:
+                    analysis += "The viewership fluctuated equally between increases and decreases. "
+                
+                # Retention analysis
+                if start_viewers > 0:
+                    retention = (end_viewers / start_viewers) * 100
+                    analysis += f"The stream retained {retention:.1f}% of its initial audience. "
+                    
+                    if retention > 100:
+                        analysis += "This suggests very strong content that attracted new viewers throughout the stream."
+                    elif retention >= 80:
+                        analysis += "This indicates good audience retention and engagement."
+                    elif retention >= 50:
+                        analysis += "This suggests moderate audience retention; consider reviewing engagement strategies."
+                    else:
+                        analysis += "This indicates significant audience drop-off; analyze key points where viewership declined."
+            else:
+                analysis = "Limited viewer data available for comprehensive analysis."
+            
+        except Exception as e:
+            print(f"Error creating viewer chart: {e}")
+            return None, "Failed to create viewer chart due to technical issues.", [], []
+        
+        # Calculate drop-off rates with comment data
+        drop_off_data = []
+        
+        for i in range(1, len(viewer_counts)):
+            prev_count = viewer_counts[i-1]
+            curr_count = viewer_counts[i]
+            
+            if prev_count > 0:
+                drop_off_rate = ((curr_count - prev_count) / prev_count) * 100
+            else:
+                drop_off_rate = 0 if curr_count == 0 else 100  # 100% increase from 0
+                
+            # Find comment analysis for this timestamp if available
+            comment_analysis = "No data available"
+            top_questions = []
+            
+            for data in self.sentiment_data:
+                try:
+                    data_time = datetime.datetime.fromisoformat(data["timestamp"])
+                    if abs((data_time - timestamps[i]).total_seconds()) < 5:  # Within 5 seconds
+                        comment_analysis = data.get("comment_analysis", "No analysis available")
+                        top_questions = data.get("top_3_questions", [])
+                        if not isinstance(top_questions, list):
+                            top_questions = []
+                        break
+                except (ValueError, TypeError, KeyError):
+                    continue
+                    
+            # Generate drop-off point with viewer data and comment context
+            drop_off_data.append({
+                "time": formatted_times[i],
+                "viewers": curr_count,
+                "prev_viewers": prev_count,
+                "drop_off_rate": drop_off_rate,
+                "comment_context": comment_analysis,
+                "top_questions": top_questions[:2] if top_questions else []  # Limit to top 2 for space
+            })
+        
+        return viewer_chart_path, analysis, drop_off_data, formatted_times
+    
+    def create_likes_chart(self, likes_data):
+        """Create a likes count chart from the collected data and return the path and analysis."""
+        if not likes_data:
+            return None, "No likes data available for analysis."
+            
+        # Sort data by timestamp
+        try:
+            sorted_data = sorted(likes_data, key=lambda x: x["timestamp"])
+        except Exception as e:
+            print(f"Error sorting likes data: {e}")
+            return None, "Error sorting likes data."
+            
+        timestamps = []
+        likes_counts = []
+        
+        for data in sorted_data:
+            if "timestamp" in data and "likes" in data:
+                try:
+                    timestamp = datetime.datetime.fromisoformat(data["timestamp"])
+                    likes = int(data["likes"])
+                    timestamps.append(timestamp)
+                    likes_counts.append(likes)
+                except (ValueError, TypeError) as e:
+                    print(f"Error parsing likes data: {e}")
+        
+        if not timestamps or not likes_counts:
+            return None, "No valid likes data points available."
+            
+        # Create likes chart
+        plt.figure(figsize=(10, 6))
+        plt.plot(timestamps, likes_counts, marker='o', linestyle='-', color='red', label='Likes')
+        plt.title('Number of Likes Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Number of Likes')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save chart
+        likes_chart_path = os.path.join(self.results_dir, f"{self.stream_name}_likes_chart.png")
+        
+        try:
+            plt.savefig(likes_chart_path)
+            plt.close()
+            
+            # Generate analysis of likes chart
+            if len(likes_counts) > 1:
+                start_likes = likes_counts[0]
+                end_likes = likes_counts[-1]
+                likes_growth = end_likes - start_likes
+                
+                analysis = f"Likes Analysis: The stream started with {start_likes} likes and ended with {end_likes} likes. "
+                
+                if likes_growth > 0:
+                    analysis += f"There was a total increase of {likes_growth} likes during the stream, "
+                    
+                    # Calculate rate of likes growth
+                    if len(likes_counts) > 2:
+                        duration_minutes = (timestamps[-1] - timestamps[0]).total_seconds() / 60
+                        likes_per_minute = likes_growth / duration_minutes if duration_minutes > 0 else 0
+                        analysis += f"averaging {likes_per_minute:.1f} new likes per minute. "
+                    else:
+                        analysis += "but we need more data points to calculate the rate. "
+                    
+                    # Analyze growth pattern
+                    diffs = [likes_counts[i] - likes_counts[i-1] for i in range(1, len(likes_counts))]
+                    max_growth_index = diffs.index(max(diffs)) if diffs else 0
+                    
+                    if max_growth_index < len(timestamps) - 1:
+                        max_growth_time = timestamps[max_growth_index + 1].strftime("%H:%M:%S")
+                        analysis += f"The fastest growth in likes occurred around {max_growth_time}, "
+                        analysis += "which may indicate particularly engaging content at that time. "
+                    
+                elif likes_growth == 0:
+                    analysis += "There was no change in likes during the stream, which may indicate limited engagement. "
+                else:
+                    analysis += f"There was an unusual decrease of {abs(likes_growth)} likes, which requires investigation. "
+                
+                # Add recommendation based on likes performance
+                if likes_growth > 100:
+                    analysis += "The stream performed exceptionally well in terms of audience appreciation."
+                elif likes_growth > 50:
+                    analysis += "The stream performed well in terms of audience appreciation."
+                elif likes_growth > 20:
+                    analysis += "The stream had moderate audience appreciation."
+                else:
+                    analysis += "Consider implementing more calls-to-action to encourage likes in future streams."
+                
+            else:
+                analysis = f"Limited likes data available. The stream had {likes_counts[0]} likes at the time of analysis."
+            
+            return likes_chart_path, analysis
+            
+        except Exception as e:
+            print(f"Error creating likes chart: {e}")
+            return None, "Failed to create likes chart due to technical issues."
+    
+    def create_comment_trends_chart(self):
+        """Create a chart showing the top comment trends/questions and return the path and analysis."""
+        if not self.comment_trends:
+            return None, "No comment trends data available for analysis."
+            
+        # Sort trends by frequency
+        sorted_trends = sorted(self.comment_trends.items(), key=lambda x: x[1], reverse=True)
+        top_trends = sorted_trends[:10]  # Top 10 trends
+        
+        if not top_trends:
+            return None, "No significant comment trends identified."
+            
+        # Create the chart
+        topics = [t[0][:40] + "..." if len(t[0]) > 40 else t[0] for t in top_trends]  # Truncate long labels
+        counts = [t[1] for t in top_trends]
+        
+        plt.figure(figsize=(12, 8))
+        bars = plt.barh(topics, counts, color='skyblue')
+        plt.title('Top Questions/Concerns in Comments')
+        plt.xlabel('Frequency')
+        plt.ylabel('Questions/Concerns')
+        
+        # Add count labels to bars
+        for i, bar in enumerate(bars):
+            plt.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2, 
+                    str(counts[i]), 
+                    va='center')
+            
+        plt.tight_layout()
+        
+        # Save chart
+        trends_chart_path = os.path.join(self.results_dir, f"{self.stream_name}_comment_trends.png")
+        try:
+            plt.savefig(trends_chart_path)
+            plt.close()
+            
+            # Generate analysis of comment trends
+            total_comments = sum(counts)
+            top_concerns = sorted_trends[:3]  # Top 3 concerns
+            
+            analysis = f"Comment Trends Analysis: A total of {total_comments} instances of specific questions/concerns were identified. "
+            
+            if top_concerns:
+                analysis += "The most common audience questions were about: "
+                for i, (concern, count) in enumerate(top_concerns):
+                    percentage = (count / total_comments) * 100 if total_comments > 0 else 0
+                    analysis += f"{concern} ({percentage:.1f}% of comments)"
+                    if i < len(top_concerns) - 1:
+                        analysis += ", "
+                    else:
+                        analysis += ". "
+            
+            # Add recommendations based on comment trends
+            analysis += "Recommendations: "
+            if top_concerns:
+                top_concern, _ = top_concerns[0]
+                analysis += f"Create dedicated content addressing '{top_concern}' to answer the most common audience question. "
+                
+                if len(top_concerns) > 1:
+                    analysis += "Consider creating an FAQ or information post addressing the top questions from this stream. "
+            else:
+                analysis += "The comment trends were diverse without clear dominant topics. "
+            
+            analysis += "Monitor these trends across multiple streams to identify consistent audience interests and concerns."
+            
+            return trends_chart_path, analysis
+            
+        except Exception as e:
+            print(f"Error creating comment trends chart: {e}")
+            return None, "Failed to create comment trends chart due to technical issues."
+
+    def generate_pdf_report(self, sentiment_data):
+        """Generate a PDF report with analysis results and charts."""
+        if not sentiment_data:
+            print("No data available to generate report")
+            return None
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(self.results_dir, f"{self.stream_name}_report_{timestamp}.pdf")
+        
+        # Create charts with analyses
+        sentiment_chart, sentiment_analysis = self.create_sentiment_chart(sentiment_data)
+        viewer_chart, viewer_analysis, drop_off_data, viewer_times = self.create_viewer_chart(self.viewer_data)
+        likes_chart, likes_analysis = self.create_likes_chart(self.likes_data)
+        comment_trends_chart, comment_analysis = self.create_comment_trends_chart()
+        
+        # Calculate overall statistics
+        avg_sentiment = sum(data.get("sentiment_score", 0) for data in sentiment_data) / len(sentiment_data) if sentiment_data else 0
+        sentiment_labels = [data.get("sentiment_label", "neutral") for data in sentiment_data]
+        most_common_sentiment = max(set(sentiment_labels), key=sentiment_labels.count) if sentiment_labels else "neutral"
+        
+        # Collect all product mentions
+        all_product_mentions = []
+        for data in sentiment_data:
+            product_mentions = data.get("product_mentions", [])
+            if isinstance(product_mentions, list):
+                all_product_mentions.extend(product_mentions)
+        
+        product_mention_counts = {}
+        for product in all_product_mentions:
+            if not product or not isinstance(product, str):
+                continue
+            product = str(product).strip()
+            if product.lower() in ["unknown", "n/a", "none"]:
+                continue
+            product_mention_counts[product] = product_mention_counts.get(product, 0) + 1
+                
+        # Get top mentioned products
+        top_products = sorted(product_mention_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        try:
+            # Create PDF with custom page class
+            class PDF(FPDF):
+                def header(self):
+                    # Set header with "Report by RAVA"
+                    self.set_font('Arial', 'B', 12)
+                    self.cell(0, 10, 'Report by RAVA', 0, 0, 'R')
+                    self.ln(15)
+                    
+                def footer(self):
+                    # Set footer with page number
+                    self.set_y(-15)
+                    self.set_font('Arial', 'I', 8)
+                    self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+            
+            # Create PDF instance
+            pdf = PDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            
+            # Add title
+            pdf.set_font("Arial", "B", 16)
+            pdf.cell(0, 10, f"TikTok Livestream Analysis Report", ln=True, align="C")
+            pdf.cell(0, 10, f"Stream: {self.stream_name}", ln=True, align="C")
+            pdf.cell(0, 10, f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+            
+            # Add summary section
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Executive Summary", ln=True)
+            pdf.set_font("Arial", "", 11)
+            pdf.multi_cell(0, 10, f"Analysis Duration: {self.duration//60} minutes")
+            pdf.multi_cell(0, 10, f"Screenshots Analyzed: {len(sentiment_data)}")
+            pdf.multi_cell(0, 10, f"Average Sentiment Score: {avg_sentiment:.2f} ({most_common_sentiment})")
+
+            if self.viewer_data:
+                max_viewers = max(data["viewers"] for data in self.viewer_data)
+                min_viewers = min(data["viewers"] for data in self.viewer_data)
+                pdf.multi_cell(0, 10, f"Peak Viewers: {max_viewers}")
+                pdf.multi_cell(0, 10, f"Minimum Viewers: {min_viewers}")
+
+            if self.likes_data:
+                max_likes = max(data["likes"] for data in self.likes_data)
+                starting_likes = self.likes_data[0]["likes"] if self.likes_data else 0
+                ending_likes = self.likes_data[-1]["likes"] if self.likes_data else 0
+                likes_growth = ending_likes - starting_likes
+                pdf.multi_cell(0, 10, f"Peak Likes: {max_likes}")
+                pdf.multi_cell(0, 10, f"Likes Growth During Stream: {likes_growth}")
+
+            # Add top products mentioned section
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "Top Products Mentioned:", ln=True)
+            pdf.set_font("Arial", "", 11)
+
+            if top_products:
+                for i, (product, count) in enumerate(top_products):
+                    pdf.multi_cell(0, 10, f"{i+1}. {product} (mentioned {count} times)")
+            else:
+                pdf.multi_cell(0, 10, "No specific products identified")
+
+            # Add viewer chart
+            if viewer_chart:
+                pdf.add_page()
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 10, "Number Of Viewers Over Time", ln=True)
+                pdf.image(viewer_chart, x=10, y=30, w=190)
+
+            # Add likes chart
+            if likes_chart:
+                pdf.add_page()
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 10, "Number Of Likes Over Time", ln=True)
+                pdf.image(likes_chart, x=10, y=30, w=190)
+
+            # Add comment trends chart
+            if comment_trends_chart:
+                pdf.add_page()
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 10, "Top Questions/Concerns in Comments", ln=True)
+                pdf.image(comment_trends_chart, x=10, y=30, w=190)
+
+            # Add sentiment chart
+            if sentiment_chart:
+                pdf.add_page()
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 10, "Sentiment Analysis Over Time", ln=True)
+                pdf.image(sentiment_chart, x=10, y=30, w=190)
+
+            # Add significant viewer changes section with comment context
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Significant Viewer Changes & Comment Context", ln=True)
+
+            # Filter for significant changes (more than 5% change)
+            significant_changes = [d for d in drop_off_data if abs(d["drop_off_rate"]) > 5]
+
+            if significant_changes:
+                # Table header
+                pdf.set_font("Arial", "B", 10)
+                pdf.cell(25, 10, "Time", border=1)
+                pdf.cell(25, 10, "Viewers", border=1)
+                pdf.cell(30, 10, "Change", border=1)
+                pdf.cell(110, 10, "Comment Context", border=1, ln=True)
+
+                # Table content
+                pdf.set_font("Arial", "", 9)
+                for data in significant_changes:
+                    change_text = f"{data['drop_off_rate']:.1f}%"
+
+                    # Format comment context - focus on top questions
+                    comment_context = "Top questions: "
+                    if data["top_questions"]:
+                        comment_context += ", ".join(data["top_questions"])
+                    else:
+                        comment_context += "None identified"
+
+                    # Truncate if too long
+                    if len(comment_context) > 100:
+                        comment_context = comment_context[:97] + "..."
+
+                    pdf.cell(25, 10, data["time"], border=1)
+                    pdf.cell(25, 10, str(data["viewers"]), border=1)
+                    pdf.cell(30, 10, change_text, border=1)
+                    pdf.cell(110, 10, comment_context, border=1, ln=True)
+            else:
+                pdf.set_font("Arial", "", 11)
+                pdf.multi_cell(0, 10, "No significant viewer changes detected.")
+
+            # Add detailed analysis
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Detailed Comment Analysis Timeline", ln=True)
+
+            # Table header
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(25, 10, "Time", border=1)
+            pdf.cell(20, 10, "Viewers", border=1)
+            pdf.cell(20, 10, "Likes", border=1)
+            pdf.cell(125, 10, "Top Questions & Concerns", border=1, ln=True)
+
+            # Table content - include specific questions
+            pdf.set_font("Arial", "", 9)
+            for data in sentiment_data:
+                timestamp = datetime.datetime.fromisoformat(data["timestamp"])
+                time_str = timestamp.strftime("%H:%M:%S")
+                viewer_count = str(data.get("viewer_count", "N/A"))
+                likes_count = str(data.get("likes_count", "N/A"))
+
+                # Get top questions
+                top_questions = data.get("top_3_questions", [])
+
+                # Format questions with numbering
+                questions_text = ""
+                for i, q in enumerate(top_questions):
+                    if i > 0:
+                        questions_text += " "
+                    questions_text += f"{i+1}. {q}"
+
+                # Truncate if too long
+                if len(questions_text) > 120:
+                    questions_text = questions_text[:117] + "..."
+
+                pdf.cell(25, 10, time_str, border=1)
+                pdf.cell(20, 10, viewer_count, border=1)
+                pdf.cell(20, 10, likes_count, border=1)
+                pdf.cell(125, 10, questions_text if questions_text else "No specific questions identified", border=1, ln=True)
+
+            # Add recommendations
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Recommendations for Future Livestreams", ln=True)
+            pdf.set_font("Arial", "", 11)
+
+            # Gather all recommendations
+            all_recommendations = []
+            for data in sentiment_data:
+                all_recommendations.extend(data.get("recommendations", []))
+
+            # Count and sort recommendations by frequency
+            rec_counts = {}
+            for rec in all_recommendations:
+                rec = str(rec).strip()
+                if rec in rec_counts:
+                    rec_counts[rec] += 1
+                else:
+                    rec_counts[rec] = 1
+
+            # Sort and get top recommendations
+            sorted_recs = sorted(rec_counts.items(), key=lambda x: x[1], reverse=True)
+            top_recs = sorted_recs[:5]  # Top 5 recommendations
+
+            # Add to PDF
+            for i, (rec, count) in enumerate(top_recs):
+                if rec and rec.lower() not in ["unknown", "n/a", "none", "check screenshot manually"]:
+                    pdf.multi_cell(0, 10, f"{i+1}. {rec} (suggested {count} times)")
+
+            # Save the PDF
+            pdf.output(report_path)
+            print(f"PDF report generated: {report_path}")
+            return report_path
+        except Exception as e:
+            print(f"Error generating PDF report: {e}")
+            return None
+
+    def run_analysis(self):
+        """Run the complete livestream analysis process."""
+        print(f"Starting livestream analysis for {self.duration} seconds...")
+        
+        # Step 1: Capture screenshots
+        self.take_screenshots()
+        
+        if not self.screenshot_paths:
+            print("No screenshots captured. Analysis aborted.")
+            return
+            
+        # Step 2: Process screenshots one by one
+        print(f"Processing {len(self.screenshot_paths)} screenshots...")
+        
+        for i, screenshot_path in enumerate(self.screenshot_paths):
+            print(f"Processing screenshot {i+1}/{len(self.screenshot_paths)}: {os.path.basename(screenshot_path)}")
+            
+            # Analyze screenshot
+            result = self.analyze_screenshot(screenshot_path)
+            self.sentiment_data.append(result)
+            
+            # Save individual result
+            result_filename = f"{os.path.basename(screenshot_path).split('.')[0]}_result.json"
+            with open(os.path.join(self.results_dir, result_filename), 'w') as f:
+                json.dump(result, f, indent=2)
+        
+        # Step 3: Generate final report
+        if self.sentiment_data:
+            print("Generating final report...")
+            report_path = self.generate_pdf_report(self.sentiment_data)
+            print(f"Analysis complete. Final report saved to: {report_path}")
+        else:
+            print("No data collected. Report generation skipped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TikTok Livestream Analysis Tool")
+    parser.add_argument("--duration", type=int, default=180, help="Analysis duration in seconds (default: 180)")
+    parser.add_argument("--interval", type=int, default=10, help="Screenshot interval in seconds (default: 10)")
+    parser.add_argument("--output", default="output", help="Output directory (default: output)")
+    parser.add_argument("--stream-name", default="product_launch", help="Stream name for file naming")
+    
+    args = parser.parse_args()
+    
+    analyzer = LivestreamAnalyzer(
+        duration=args.duration,
+        interval=args.interval,
+        output_dir=args.output,
+        stream_name=args.stream_name
+    )
+    
+    analyzer.run_analysis()
+
+if __name__ == "__main__":
+    main()
